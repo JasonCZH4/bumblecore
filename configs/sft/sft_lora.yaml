@@ -1,0 +1,53 @@
+training_stage: "sft"
+finetuning_type: "lora"
+
+# Model & Tokenizer
+model_name_or_path: "<your base model path>"  
+trust_remote_code: true                         
+tokenizer_use_fast: true
+
+# Dataset
+dataset_path: "<your dataset path>"          
+cutoff_len: 2048                              
+
+# Training
+num_epochs: 3.0
+learning_rate: 5e-5                          
+lr_scheduler_type: "cosine"                               
+enable_gradient_checkpointing: true                   
+warmup_ratio: 0.1
+
+# Batch Size
+train_micro_batch_size_per_gpu: 2              
+gradient_accumulation_steps: 8                  
+
+# Precision
+train_model_precision: "bf16"                   
+
+# DeepSpeed
+deepspeed_config_path: "<your deepspeed config path>" 
+
+# Save & Log
+output_dir: "<your output directory>"                 
+save_steps: 100
+save_total_limit: 3
+save_last: true
+logging_steps: 10
+save_train_log: true
+use_tensorboard: true
+
+# LoRA 配置
+lora_rank: 64                                  
+lora_alpha: 128                                
+lora_dropout: 0.1
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj                              
+
+average_tokens_across_devices: false
+num_local_io_workers: null  # 整数，不传则根据gpu数量自动计算
