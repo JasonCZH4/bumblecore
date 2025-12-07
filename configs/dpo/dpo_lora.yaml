@@ -1,6 +1,6 @@
 # 训练阶段：监督微调
 training_stage: "dpo"
-finetuning_type: "full"
+finetuning_type: "lora"
 
 # Model & Tokenizer
 model_name_or_path: "<your base model path>"  

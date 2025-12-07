@@ -7,4 +7,3 @@ python tools/merge_lora.py \
   --device_map auto \
   --trust_remote_code \
   --low_cpu_mem_usage
-
