@@ -67,7 +67,10 @@ class BaseTrainer:
         self.training_metrics = [] if self.rank == 0 else None
     
     def _init_distributed(self):
+        # deepspeed.utils.logging.set_log_level_from_string("info")
         deepspeed.init_distributed()
+        self.local_rank = deepspeed.comm.get_local_rank()
+        torch.cuda.set_device(self.local_rank)
         self.world_size = deepspeed.comm.get_world_size()
         self.rank = deepspeed.comm.get_rank()
 
@@ -314,26 +317,24 @@ class BaseTrainer:
                 shutil.rmtree(old_ckpt)
     
     def _save_checkpoint(self, step, is_last=False):
-        if is_last:
-            if self.rank == 0:
-                self._save_tokenizer(self.config.output_dir)
-                self._save_train_model(self.config.output_dir)
-        else:
-            tag = str(step)
-            ckpt_dir = os.path.join(self.config.output_dir, f"checkpoint-{tag}")
-            os.makedirs(ckpt_dir, exist_ok=True)
-            self.model_engine.save_checkpoint(
-                ckpt_dir,
-                exclude_frozen_parameters=(self.config.finetuning_type == "lora")
-            )
 
-            if self.rank == 0:
-                self._save_tokenizer(ckpt_dir)
-                self._save_train_model(ckpt_dir)
+        tag = str(step)
+        ckpt_dir = os.path.join(self.config.output_dir, f"checkpoint-{tag}")
+        os.makedirs(ckpt_dir, exist_ok=True)
+        self.model_engine.save_checkpoint(
+            ckpt_dir,
+            exclude_frozen_parameters=(self.config.finetuning_type == "lora")
+        )
 
+        if self.rank == 0:
+            self._save_tokenizer(ckpt_dir)
+            self._save_train_model(ckpt_dir)
+
+            if not is_last:
                 self.ckpt_queue.append(ckpt_dir)
                 self._rotate_checkpoints()
 
+        self._print_log(f"Saving model at step {step} to {ckpt_dir}")
 
     def _save_tokenizer(self, ckpt_dir):
         if isinstance(self.tokenizer, (PreTrainedTokenizer, PreTrainedTokenizerFast)):
@@ -399,12 +400,12 @@ class BaseTrainer:
         global_step = new_step
         computation_result = self.gather_scalar_for_log(computation_result)
 
-        if global_step % self.config.save_steps == 0:
-            self._save_checkpoint(global_step)
-
         if self.rank == 0:
             progress_bar.update(1)
             self._handle_logging_and_progress(global_step, computation_result)
+        
+        if global_step % self.config.save_steps == 0:
+            self._save_checkpoint(global_step)
 
         return global_step
     
@@ -524,7 +525,7 @@ class BaseTrainer:
             self._print_log("TensorBoard writer closed.")
 
         if dist.is_initialized():
-            dist.barrier()
+            dist.barrier(device_ids=[self.local_rank])
             dist.destroy_process_group()
 
 
