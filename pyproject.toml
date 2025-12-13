@@ -23,7 +23,7 @@ classifiers = [
 dependencies = [
     "torch==2.7.1",
     "transformers==4.57.3",
-    "deepspeed==0.17.2",
+    "deepspeed==0.18.3",
     "peft==0.17.1",
     "tensorboard==2.20.0",
     "tqdm==4.67.1",
