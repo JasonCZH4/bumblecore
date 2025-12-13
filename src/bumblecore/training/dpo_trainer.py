@@ -234,8 +234,7 @@ class DPOTrainer(BaseTrainer):
     
     @override
     def gather_scalar_for_log(self, computation_result):
-        loss = computation_result["loss"]
-        loss_tensor = loss.detach().clone()
+        loss_tensor = computation_result["loss"]
         dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
         computation_result["avg_loss"] = (loss_tensor / self.world_size).item()
 

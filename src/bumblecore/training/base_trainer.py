@@ -8,7 +8,7 @@ import math
 from tqdm import tqdm
 from transformers import (
     AutoModelForCausalLM,
-    get_cosine_schedule_with_warmup,
+    get_scheduler,
     PreTrainedTokenizer,
     PreTrainedTokenizerFast,
     AutoConfig,
@@ -171,7 +171,6 @@ class BaseTrainer:
 
 
     def _configure_model_for_training(self, model):
-        # model.config.use_cache = False
         vocab_size = model.config.vocab_size
         if self.config.enable_gradient_checkpointing:
             model.gradient_checkpointing_enable()
@@ -266,7 +265,7 @@ class BaseTrainer:
         num_update_steps_per_epoch = max(num_update_steps_per_epoch, 1)
         max_steps = math.ceil(num_update_steps_per_epoch * self.config.num_epochs)
         warmup_steps = math.ceil(self.config.warmup_ratio * max_steps)
-        
+
         return num_update_steps_per_epoch, max_steps, warmup_steps
 
 
@@ -277,20 +276,50 @@ class BaseTrainer:
             lr=self.config.learning_rate,
             weight_decay=self.config.weight_decay,
         )
+    
+    # def _get_decay_parameter_names(self, model) -> set[str]:
+    #     decay_params = set()
+    #     for name, param in model.named_parameters():
+    #         if not param.requires_grad:
+    #             continue
+    #         # Skip bias and normalization layers
+    #         if any(nd in name.lower() for nd in ["bias", "layernorm", "rmsnorm"]):
+    #             continue
+    #         decay_params.add(name)
+    #     return decay_params
+    
+    # def _build_optimizer(self):
+    #     decay_param_names = self._get_decay_parameter_names(self.model)
+
+    #     decay_params = []
+    #     no_decay_params = []
+
+    #     for name, param in self.model.named_parameters():
+    #         if not param.requires_grad:
+    #             continue
+    #         if name in decay_param_names:
+    #             decay_params.append(param)
+    #         else:
+    #             no_decay_params.append(param)
+
+    #     optimizer_grouped_parameters = [
+    #         {"params": decay_params, "weight_decay": self.config.weight_decay},
+    #         {"params": no_decay_params, "weight_decay": 0.0},
+    #     ]
+
+    #     return torch.optim.AdamW(
+    #         optimizer_grouped_parameters,
+    #         lr=self.config.learning_rate,
+    #     )
 
 
     def _build_scheduler(self):
-        if self.config.lr_scheduler_type == "cosine":
-            return get_cosine_schedule_with_warmup(
-                self.optimizer,
-                num_warmup_steps=self.warmup_steps,
-                num_training_steps=self.max_steps,
-            )
-        else:
-            return torch.optim.lr_scheduler.LambdaLR(
-                self.optimizer,
-                lr_lambda=lambda step: min(1.0, step / max(1, self.warmup_steps))
-            )
+        return get_scheduler(
+            name= self.config.lr_scheduler_type,
+            optimizer = self.optimizer,
+            num_warmup_steps=self.warmup_steps,
+            num_training_steps=self.max_steps,
+        )
 
 
     def _initialize_deepspeed_engine(self):
@@ -360,6 +389,7 @@ class BaseTrainer:
 
 
     def train(self):
+        self.tr_loss = torch.tensor(0.0, device=self.model_engine.device)
 
         progress_bar = tqdm(total=self.max_steps, desc="Training") if self.rank == 0 else None
         
@@ -393,11 +423,15 @@ class BaseTrainer:
     def _train_batch(self, batch, global_step, progress_bar):
         computation_result = self._train_step(batch)
 
+        self.tr_loss += computation_result["loss"]
+
         new_step = self.model_engine.global_steps
         if new_step <= global_step:
             return global_step
-
+        
         global_step = new_step
+
+        computation_result["loss"] = self.tr_loss / self.config.gradient_accumulation_steps
         computation_result = self.gather_scalar_for_log(computation_result)
 
         if self.rank == 0:
@@ -407,6 +441,7 @@ class BaseTrainer:
         if global_step % self.config.save_steps == 0:
             self._save_checkpoint(global_step)
 
+        self.tr_loss.zero_()
         return global_step
     
 
@@ -425,6 +460,7 @@ class BaseTrainer:
         loss = computation_result["loss"]
         self.model_engine.backward(loss)
         self.model_engine.step()
+        computation_result["loss"] = loss.detach().clone()
         return computation_result
     
 
@@ -452,8 +488,7 @@ class BaseTrainer:
     
 
     def gather_scalar_for_log(self, computation_result):
-        loss = computation_result["loss"]
-        loss_tensor = loss.detach().clone()
+        loss_tensor = computation_result["loss"]
         dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
         computation_result["avg_loss"] = (loss_tensor / self.world_size).item()
         return computation_result
@@ -525,7 +560,7 @@ class BaseTrainer:
             self._print_log("TensorBoard writer closed.")
 
         if dist.is_initialized():
-            dist.barrier(device_ids=[self.local_rank])
+            dist.barrier()
             dist.destroy_process_group()
 
 
@@ -597,4 +632,4 @@ class BaseTrainer:
         self._print_log("  Enabled features / key configurations:")
         for feat in enabled_features:
             self._print_log(f"    - {feat}")
-        self._print_log("=" * 80)     
+        self._print_log("=" * 80)
