@@ -4,17 +4,43 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>BumbleChat</title>
+    <link rel="icon" href="/static/img/logo.jpg" type="image/jpeg">
     <link rel="stylesheet" href="/static/css/styles.css">
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 </head>
 <body>
     <div id="app-container">
+        <!-- 顶部区域 -->
+        <div id="top-header">
+            <div id="logo-wrapper">
+                <img src="/static/img/black.png" alt="Logo" id="header-logo" class="logo-light">
+                <img src="/static/img/white.png" alt="Logo" id="header-logo-dark" class="logo-dark">
+            </div>
+            <div id="top-buttons">
+                <button id="history-button" class="top-button" title="历史对话">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round">
+                        <rect x="4" y="4" width="16" height="16" rx="1"></rect>
+                        <line x1="9" y1="4" x2="9" y2="20"></line>
+                    </svg>
+                </button>
+                <button id="new-chat-button" class="top-button" title="新开会话">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="12" y1="5" x2="12" y2="19"></line>
+                        <line x1="5" y1="12" x2="19" y2="12"></line>
+                    </svg>
+                </button>
+            </div>
+        </div>
+        
+        <!-- Logo区域 -->
+        <div id="logo-container" class="centered-logo">
+            <img src="/static/img/bumblebee.jpg" alt="Bumblebee Logo" id="logo">
+        </div>
+        
         <!-- 聊天消息区域 -->
         <div id="chat-container">
             <!-- 顶部白色遮罩条 -->
-            <div id="top-overlay">
-                <div id="top-overlay-text">🐝 BumbleChat</div>
-            </div>
+            <div id="top-overlay"></div>
             <div id="messages"></div>
         </div>
         
@@ -23,13 +49,13 @@
             <div id="input-wrapper">
                 <textarea 
                     id="user-input" 
-                    placeholder="与BumbleBee聊天"
+                    placeholder="给bumblebee发送消息"
                     rows="1"
                 ></textarea>
                 <button id="send-button" title="发送">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <line x1="22" y1="2" x2="11" y2="13"></line>
-                        <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                        <line x1="12" y1="5" x2="12" y2="19"></line>
+                        <polyline points="5 12 12 5 19 12"></polyline>
                     </svg>
                 </button>
             </div>
@@ -44,6 +70,9 @@
         const inputWrapper = document.getElementById('input-wrapper');
         const userInput = document.getElementById('user-input');
         const sendButton = document.getElementById('send-button');
+        const newChatButton = document.getElementById('new-chat-button');
+        const historyButton = document.getElementById('history-button');
+        const logoContainer = document.getElementById('logo-container');
         
         // 生成或获取 session ID
         let sessionId = localStorage.getItem('sessionId');
@@ -87,6 +116,9 @@
         function moveInputToBottom() {
             inputContainer.classList.remove('centered');
             inputContainer.classList.add('bottom');
+            // 隐藏居中logo
+            logoContainer.classList.remove('centered-logo');
+            logoContainer.classList.add('top-logo-hidden');
             // 延迟更新 padding，确保 DOM 更新完成
             setTimeout(() => {
                 updateMessagesPadding();
@@ -258,8 +290,43 @@
             }
         }
 
+        // 新开会话
+        async function newChat() {
+            try {
+                const response = await fetch('/session', {
+                    method: 'DELETE',
+                });
+                
+                if (response.ok) {
+                    // 清除前端显示的消息
+                    messagesContainer.innerHTML = '';
+                    // 生成新的 session ID
+                    sessionId = 'session_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+                    localStorage.setItem('sessionId', sessionId);
+                    // 重置输入框和logo位置
+                    inputContainer.classList.remove('bottom');
+                    inputContainer.classList.add('centered');
+                    logoContainer.classList.remove('top-logo-hidden');
+                    logoContainer.classList.add('centered-logo');
+                    updateMessagesPadding();
+                } else {
+                    console.error('新开会话失败:', response.status);
+                }
+            } catch (error) {
+                console.error('新开会话错误:', error);
+            }
+        }
+
+        // 历史对话
+        function showHistory() {
+            // TODO: 实现历史对话功能
+            console.log('显示历史对话');
+        }
+
         // 事件监听
         sendButton.addEventListener('click', sendMessage);
+        newChatButton.addEventListener('click', newChat);
+        historyButton.addEventListener('click', showHistory);
         
         userInput.addEventListener('keydown', (e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
