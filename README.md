@@ -322,7 +322,7 @@ bash scripts/bumblechat.sh
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="<启动服务的api地址>/v1/chat/completions",
+    base_url="<启动服务的api地址>/v1",
     api_key="dummy" 
 )
 
