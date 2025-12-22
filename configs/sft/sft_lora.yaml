@@ -29,7 +29,7 @@ deepspeed_config_path: "./configs/deepspeed/ds_z2_config.json"
 
 # Save & Log
 output_dir: "<your output directory>"                 
-save_steps: 15
+save_steps: 10000
 save_total_limit: 3
 save_last: true
 logging_steps: 1
@@ -44,10 +44,7 @@ lora_target_modules:
   - q_proj
   - k_proj
   - v_proj
-  - o_proj
-  - gate_proj
-  - up_proj
-  - down_proj                              
+  - o_proj                            
 
 average_tokens_across_devices: false
 num_local_io_workers: null  # 整数，不传则根据gpu数量自动计算
