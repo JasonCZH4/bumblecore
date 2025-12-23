@@ -42,6 +42,14 @@ def show_sample(
     tqdm.write(output.rstrip())
 
 
+def get_padding_value(tokenizer):
+    if tokenizer.pad_token_id is not None:
+        return tokenizer.pad_token_id
+    
+    eos = tokenizer.eos_token_id
+    return eos[0] if isinstance(eos, list) else eos
+
+
 class PretrainDataset(Dataset):
     
     def __init__(
@@ -228,6 +236,7 @@ class DPODataset(Dataset):
         self.train_dataset = train_dataset
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.input_ids_padding_value = get_padding_value(tokenizer=self.tokenizer)
         self.has_shown_sample = False
     
     def __len__(self):
@@ -255,7 +264,7 @@ class DPODataset(Dataset):
         )
         input_ids = torch.tensor(full["input_ids"], dtype=torch.long)
         attention_mask = torch.tensor(full["attention_mask"], dtype=torch.long)
-        prompt_len = torch.tensor(prompt_input_ids, dtype=torch.long).ne(self.tokenizer.pad_token_id).sum().item()
+        prompt_len = torch.tensor(prompt_input_ids, dtype=torch.long).ne(self.input_ids_padding_value).sum().item()
         labels = input_ids.clone()
         labels[:prompt_len] = -100
 
@@ -324,7 +333,7 @@ class DPODataset(Dataset):
 
 class DataCollator:
     def __init__(self, tokenizer):
-        self.tokenizer = tokenizer
+        self.input_ids_padding_value = get_padding_value(tokenizer=tokenizer)
 
     def __call__(self, batch):
         input_ids = [item["input_ids"] for item in batch]
@@ -332,7 +341,7 @@ class DataCollator:
         labels = [item["labels"] for item in batch]
 
         input_ids = self.right_pad_sequence(
-            input_ids, padding_value=self.tokenizer.pad_token_id
+            input_ids, padding_value=self.input_ids_padding_value
         )
         attention_mask = self.right_pad_sequence(attention_mask, padding_value=0)
         labels = self.right_pad_sequence(labels, padding_value=-100)
@@ -349,7 +358,7 @@ class DataCollator:
 
 class DPOCollator:
     def __init__(self, tokenizer):
-        self.tokenizer = tokenizer
+        self.input_ids_padding_value = get_padding_value(tokenizer=tokenizer)
 
     def __call__(self, batch):
         chosen_input_ids = [item["chosen_input_ids"] for item in batch]
@@ -367,7 +376,7 @@ class DPOCollator:
 
         return dict(
             chosen_input_ids=self._right_pad_to_len(
-            chosen_input_ids, max_length, self.tokenizer.pad_token_id
+            chosen_input_ids, max_length, self.input_ids_padding_value
         ),
             chosen_attention_mask=self._right_pad_to_len(
             chosen_attention_mask, max_length, 0
@@ -376,7 +385,7 @@ class DPOCollator:
             chosen_labels, max_length, -100
         ),
             rejected_input_ids=self._right_pad_to_len(
-            rejected_input_ids, max_length, self.tokenizer.pad_token_id
+            rejected_input_ids, max_length, self.input_ids_padding_value
         ),
             rejected_attention_mask=self._right_pad_to_len(
             rejected_attention_mask, max_length, 0
