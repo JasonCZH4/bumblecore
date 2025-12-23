@@ -236,7 +236,7 @@ class DPODataset(Dataset):
         self.train_dataset = train_dataset
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.input_ids_padding_value = get_padding_value(tokenizer=self.tokenizer)
+
         self.has_shown_sample = False
     
     def __len__(self):
@@ -264,7 +264,7 @@ class DPODataset(Dataset):
         )
         input_ids = torch.tensor(full["input_ids"], dtype=torch.long)
         attention_mask = torch.tensor(full["attention_mask"], dtype=torch.long)
-        prompt_len = torch.tensor(prompt_input_ids, dtype=torch.long).ne(self.input_ids_padding_value).sum().item()
+        prompt_len = len(prompt_input_ids)
         labels = input_ids.clone()
         labels[:prompt_len] = -100
 
