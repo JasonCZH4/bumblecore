@@ -389,7 +389,7 @@ class BaseTrainer:
 
 
     def train(self):
-        self.tr_loss = torch.tensor(0.0, device=self.model_engine.device)
+        self.tr_accumulated = {}
 
         progress_bar = tqdm(total=self.max_steps, desc="Training") if self.rank == 0 else None
         
@@ -423,7 +423,7 @@ class BaseTrainer:
     def _train_batch(self, batch, global_step, progress_bar):
         computation_result = self._train_step(batch)
 
-        self.tr_loss += computation_result["loss"]
+        self._accumulate_training_results(computation_result)
 
         new_step = self.model_engine.global_steps
         if new_step <= global_step:
@@ -431,19 +431,60 @@ class BaseTrainer:
         
         global_step = new_step
 
-        computation_result["loss"] = self.tr_loss / self.config.gradient_accumulation_steps
-        computation_result = self.gather_scalar_for_log(computation_result)
+        averaged_result = self._get_averaged_results()
+        averaged_result = self.gather_scalar_for_log(averaged_result)
 
         if self.rank == 0:
             progress_bar.update(1)
-            self._handle_logging_and_progress(global_step, computation_result)
+            self._handle_logging_and_progress(global_step, averaged_result)
         
         if global_step % self.config.save_steps == 0:
             self._save_checkpoint(global_step)
 
-        self.tr_loss.zero_()
+        self._reset_accumulated_results()
+        
         return global_step
     
+    def _get_accumulation_keys(self):
+        return {"loss"}
+    
+    def _accumulate_training_results(self, computation_result):
+        accumulation_keys = self._get_accumulation_keys()
+        self._accumulate_single_value("loss", computation_result["loss"])
+        if "metrics" in computation_result:
+            for key, value in computation_result["metrics"].items():
+                self._accumulate_single_value(key, value, should_accumulate=(key in accumulation_keys))
+    
+    def _accumulate_single_value(self, key, value, should_accumulate=True):
+        if should_accumulate:
+            if key not in self.tr_accumulated:
+                self.tr_accumulated[key] = torch.tensor(0.0, device=self.model_engine.device)
+            self.tr_accumulated[key] += value
+        else:
+            self.tr_accumulated[key] = value
+    
+    def _get_averaged_results(self):
+        accumulation_keys = self._get_accumulation_keys()
+        result = {}
+        
+        if "loss" in self.tr_accumulated:
+            result["loss"] = self.tr_accumulated["loss"] / self.config.gradient_accumulation_steps
+        
+        result["metrics"] = {}
+        for key, accumulated_value in self.tr_accumulated.items():
+            if key == "loss":
+                continue
+            
+            if key in accumulation_keys:
+                result["metrics"][key] = accumulated_value / self.config.gradient_accumulation_steps
+            else:
+                result["metrics"][key] = accumulated_value
+        
+        return result
+    
+    def _reset_accumulated_results(self):
+        for key in self.tr_accumulated:
+            self.tr_accumulated[key].zero_()
 
     def _handle_logging_and_progress(self, global_step, computation_result):
         if global_step % self.config.logging_steps == 0:

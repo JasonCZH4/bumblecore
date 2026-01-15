@@ -233,6 +233,10 @@ class DPOTrainer(BaseTrainer):
         )
     
     @override
+    def _get_accumulation_keys(self):
+        return {"loss", "rewards_accuracies", "rewards_margins"}
+    
+    @override
     def gather_scalar_for_log(self, computation_result):
         loss_tensor = computation_result["loss"]
         dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
