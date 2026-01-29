@@ -147,6 +147,13 @@ class BumblebeeConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+        
+        if not hasattr(self, 'auto_map') or self.auto_map is None:
+            self.auto_map = {
+                "AutoConfig": "modeling_bumblebee.BumblebeeConfig",
+                "AutoModelForCausalLM": "modeling_bumblebee.BumblebeeForCausalLM",
+                "AutoModel": "modeling_bumblebee.BumblebeeModel",
+            }
 
 
 class BumblebeeMLP(nn.Module):
