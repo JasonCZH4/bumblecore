@@ -1,5 +1,6 @@
 import os
 import json
+import inspect
 from collections import deque
 from typing import Callable
 import shutil
@@ -150,7 +151,13 @@ class BaseTrainer:
             )
             if self.config.training_stage == "pretrain":
                 config = AutoConfig.from_pretrained(self.config.model_name_or_path)
-                model = AutoModelForCausalLM.from_config(config, **common_kwargs)
+                is_registered_model = config.model_type == "bumblebee"
+                pretrain_kwargs = dict(
+                    trust_remote_code=False if is_registered_model else self.config.trust_remote_code,
+                    attn_implementation=common_kwargs["attn_implementation"],
+                    dtype=common_kwargs["dtype"],
+                )
+                model = AutoModelForCausalLM.from_config(config, **pretrain_kwargs)
                 self._print_log(f"[{self.config.training_stage}] Initialized from config: {self.config.model_name_or_path}")
             elif self.config.training_stage in ["continue_pretrain", "sft", "dpo"]:
                 model = AutoModelForCausalLM.from_pretrained(
@@ -210,7 +217,7 @@ class BaseTrainer:
         if self.config.finetuning_type == "lora": 
             model = self._apply_lora(model)
 
-        # self._load_generation_config_from_pretrained(model)
+        self._load_generation_config_from_pretrained(model)
         
         return model, vocab_size
 
@@ -365,9 +372,31 @@ class BaseTrainer:
 
         self._print_log(f"Saving model at step {step} to {ckpt_dir}")
 
+
     def _save_tokenizer(self, ckpt_dir):
         if isinstance(self.tokenizer, (PreTrainedTokenizer, PreTrainedTokenizerFast)):
             self.tokenizer.save_pretrained(ckpt_dir)
+
+
+    def _save_model_code_files(self, ckpt_dir):
+        
+        MODEL_CONFIG = {
+            "bumblebee": (BumblebeeForCausalLM, ["modeling_bumblebee.py"]),
+        }
+        
+        model_type = self.model_engine.module.config.model_type
+        config = MODEL_CONFIG.get(model_type)
+        
+        if not config:
+            return
+        
+        model_class, files_to_copy = config
+        model_dir = os.path.dirname(inspect.getfile(model_class))
+        
+        for filename in files_to_copy:
+            src_file = os.path.join(model_dir, filename)
+            shutil.copy2(src_file, os.path.join(ckpt_dir, filename))
+            self._print_log(f"Copied {filename} to {ckpt_dir}")
 
 
     def _save_train_model(self, ckpt_dir):
@@ -386,6 +415,8 @@ class BaseTrainer:
             safe_serialization=True,
             max_shard_size="5GB",
         )
+        
+        self._save_model_code_files(ckpt_dir)
 
 
     def train(self):
