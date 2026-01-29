@@ -81,9 +81,10 @@ def test_pretrain_dataset_with_bos_token():
         dataset = PretrainDataset(train_dataset, tokenizer, max_length=128)
         result = dataset[0]
         
-        # 期望输出：文本 tokenized（没有 eos，因为 eos_token_id 是 None）
+        # 期望输出：文本 tokenized + <|im_end|>（当 eos_token_id 是 None 时，会添加 <|im_end|>）
         test_tokens = tokenizer("Test", return_tensors="pt", add_special_tokens=False)["input_ids"].squeeze(0)
-        expected_input_ids = test_tokens
+        im_end_tokens = tokenizer("<|im_end|>", return_tensors="pt", add_special_tokens=False)["input_ids"].squeeze(0)
+        expected_input_ids = torch.cat([test_tokens, im_end_tokens])
         expected_attention_mask = torch.ones_like(expected_input_ids)
         expected_labels = expected_input_ids.clone()
         
@@ -432,6 +433,3 @@ def test_dpo_collator():
     assert torch.equal(result["rejected_input_ids"], expected["rejected_input_ids"])
     assert torch.equal(result["rejected_attention_mask"], expected["rejected_attention_mask"])
     assert torch.equal(result["rejected_labels"], expected["rejected_labels"])
-
-
-
