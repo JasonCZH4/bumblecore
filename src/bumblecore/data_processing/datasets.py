@@ -8,6 +8,10 @@ from rich.table import Table
 from rich.text import Text
 from tqdm import tqdm
 
+import math
+import multiprocessing as mp
+from itertools import chain
+
 
 def show_sample(
     input_ids, 
@@ -119,24 +123,164 @@ class PretrainDataset(Dataset):
         return sample
 
 
+def calculate_matched_group(sequences, packing_length: int, is_finished: bool = True):
+    """Bin-packing via First Fit Decreasing (https://arxiv.org/pdf/2404.10830)."""
+    if len(sequences) == 0:
+        return [], []
+    import binpacking
+    # sequences 是 [(index, length), ...] 列表
+    # weight_pos=1 表示长度在元组第二个位置
+    # 将一组物品分配到多个容量固定的箱子（bins）中，使得每个箱子的总容量不超过指定的最大值。
+    sequences = binpacking.to_constant_volume(sequences, packing_length, weight_pos=1)
+    # sequences 是列表的列表，每个子列表包含多个 (index, length) 元组
+    # 如果不是最后一批，保留最后一个不完整组用于下一批
+    if sequences and not is_finished:
+        sequences, ret_sequences = sequences[:-1], sequences[-1]
+    else:
+        ret_sequences = []
+    return sequences, ret_sequences
+
+def split_list(lst, n):
+    # 划分列表为n个子列表，对应n个子进程处理
+    k, m = divmod(len(lst), n)
+    return [lst[i * k + min(i, m):(i + 1) * k + min(i + 1, m)] for i in range(n)]
+
+
+def _is_master():
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank() == 0
+    return True
+
+
+def _is_dist():
+    return dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
 
 class SFTDataset(Dataset):
-    
+    PACKING_BATCH_SIZE = 1000
+
     def __init__(
         self,
         train_dataset,
         tokenizer,
         max_length,
+        # ── new packing args ──
+        packing: bool = False,
+        packing_num_proc: int = 1,
     ):
         self.train_dataset = train_dataset
         self.tokenizer = tokenizer
         self.max_length = max_length
-
         self.has_shown_sample = False
 
-    def __len__(self):
-        return len(self.train_dataset)
-    
+        # ── packing bookkeeping ──
+        self.packing = packing
+        self.packing_length = max_length
+        self.packed_idx = None
+        self.packed_length = None
+
+        if self.packing:
+            self.packing_num_proc = min(
+                packing_num_proc,
+                max(1, math.ceil(len(train_dataset) / self.PACKING_BATCH_SIZE)),
+            )
+            self._out_queue = mp.Queue()
+            self._setup_packing()
+
+    # ------------------------------------------------------------------ #
+    #                    packing index construction                       #
+    # ------------------------------------------------------------------ #
+
+    def _compute_lengths(self) -> list[int]:
+        """Tokenize every sample once to get its length."""
+        lengths = []
+        for idx in tqdm(range(len(self.train_dataset)), desc="Computing sequence lengths"):
+            messages = self.train_dataset[idx]["messages"]
+            tools = self.train_dataset[idx].get("tools", None)
+            tokens = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=False,
+                truncation=True,
+                max_length=self.max_length,
+                tools=tools if tools else None,
+            )
+            lengths.append(len(tokens))
+        return lengths
+
+    def _setup_packing(self):
+        """Build packed_idx / packed_length using multi-process bin-packing."""
+        if _is_master():
+            # 计算每条数据的长度
+            lengths = self._compute_lengths()
+            offset = 0
+            chunked_lengths = split_list(lengths, self.packing_num_proc)
+
+            # launch workers
+            for i in range(self.packing_num_proc):
+                worker = mp.Process(
+                    target=self._create_packed_idx,
+                    args=(i, offset, chunked_lengths[i]),
+                    daemon=True,
+                )
+                worker.start()
+                offset += len(chunked_lengths[i])
+
+            # collect results
+            self.packed_idx = [[] for _ in range(self.packing_num_proc)]
+            self.packed_length = [[] for _ in range(self.packing_num_proc)]
+
+            desc = (
+                "Packing: "
+                if self.packing_num_proc == 1
+                else f"Packing (num_proc={self.packing_num_proc}): "
+            )
+            with tqdm(total=len(lengths), dynamic_ncols=True, desc=desc) as pbar:
+                finished = 0
+                while finished < self.packing_num_proc:
+                    rank, sequences, data_len = self._out_queue.get()
+                    if data_len == -1:          # sentinel
+                        finished += 1
+                        continue
+                    pbar.update(data_len)
+                    # (idx, length)
+                    self.packed_idx[rank] += [[x[0] for x in seq] for seq in sequences]
+                    # sum的结果应该接近packing_length
+                    self.packed_length[rank] += [sum(x[1] for x in seq) for seq in sequences]
+
+            self.packed_idx = list(chain.from_iterable(self.packed_idx))
+            self.packed_length = list(chain.from_iterable(self.packed_length))
+        else:
+            self.packed_idx, self.packed_length = None, None
+
+        # broadcast to all ranks
+        if _is_dist():
+            obj_list = [(self.packed_idx, self.packed_length)]
+            dist.broadcast_object_list(obj_list)
+            self.packed_idx, self.packed_length = obj_list[0]
+
+    def _create_packed_idx(self, rank: int, offset: int, lengths: list[int]):
+        """Worker: stream bin-packing results back through self._out_queue."""
+        # 这个i + offset 用来定位数据的源数据集中的位置
+        data = [(i + offset, length) for i, length in enumerate(lengths)]
+        i = 0
+        input_data: list = []
+        while True:
+            new_data = data[i : i + self.PACKING_BATCH_SIZE]
+            input_data += new_data
+            if not input_data:
+                break
+            i += self.PACKING_BATCH_SIZE
+            is_finished = i >= len(data)
+            sequences, input_data = calculate_matched_group(
+                input_data, self.packing_length, is_finished=is_finished
+            )
+            # (进程号，packing结果，剩余数据长度)
+            self._out_queue.put((rank, sequences, len(new_data)))
+        self._out_queue.put((rank, [], -1))  # sentinel
+
+    # ------------------------------------------------------------------ #
+    #                        original SFT logic                          #
+    # ------------------------------------------------------------------ #
 
     def create_conversation_manually(self, messages, tools):
 
@@ -158,7 +302,6 @@ class SFTDataset(Dataset):
 
         for i, message in enumerate(messages):
             if message["role"] == "assistant":
-
                 context_with_reply = messages[: i + 1]
                 full_tokens = self.tokenizer.apply_chat_template(
                     context_with_reply,
@@ -169,66 +312,253 @@ class SFTDataset(Dataset):
                     tools=tools if tools else None,
                 )
                 reply_end_pos = len(full_tokens)
-
                 assistant_masks[current_pos:reply_end_pos] = [1] * (reply_end_pos - current_pos)
-
             else:
-
-                prompt_context = messages[: i + 1]
-
                 if message["role"] == "system":
                     continue
-
-                else:
-                    prompt_tokens = self.tokenizer.apply_chat_template(
-                        prompt_context,
-                        tokenize=True,
-                        add_generation_prompt=True,
-                        truncation=True,
-                        max_length=self.max_length,
-                        tools=tools if tools else None,
-                    )
-                    current_pos = len(prompt_tokens)
+                prompt_context = messages[: i + 1]
+                prompt_tokens = self.tokenizer.apply_chat_template(
+                    prompt_context,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    truncation=True,
+                    max_length=self.max_length,
+                    tools=tools if tools else None,
+                )
+                current_pos = len(prompt_tokens)
 
         input_ids = torch.tensor(input_ids, dtype=torch.long)
         attention_mask = torch.tensor(attention_mask, dtype=torch.long)
         labels = input_ids.clone()
-
         labels[torch.tensor(assistant_masks, dtype=torch.bool) == 0] = -100
 
         return dict(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-    
 
     def _show_train_sample(self, input_ids, labels):
-
         if dist.is_available() and dist.is_initialized():
             rank = dist.get_rank()
         else:
-            rank = 0 
+            rank = 0
         worker_info = get_worker_info()
         is_main_worker = (worker_info is None) or (worker_info.id == 0)
         if rank == 0 and is_main_worker and not self.has_shown_sample:
             show_sample(
                 input_ids=input_ids,
                 labels=labels,
-                tokenizer = self.tokenizer,
+                tokenizer=self.tokenizer,
                 title="SFT Input and Labels",
                 left_column="Input IDs",
-                right_column="Labels"
+                right_column="Labels",
             )
             self.has_shown_sample = True
-    
-    def __getitem__(self, idx):
-        messages = self.train_dataset[idx]["messages"]
-        tools = self.train_dataset[idx]["tools"]
-        sample = self.create_conversation_manually(messages, tools)
 
-        self._show_train_sample(
-            input_ids=sample["input_ids"],
-            labels=sample["labels"],
+    # ------------------------------------------------------------------ #
+    #                      __len__  /  __getitem__                       #
+    # ------------------------------------------------------------------ #
+
+    def __len__(self):
+        if self.packing:
+            return len(self.packed_idx)
+        return len(self.train_dataset)
+
+    def _process_single_sample(self, idx: int) -> dict:
+        """Tokenize one sample (shared by normal & packing paths)."""
+        messages = self.train_dataset[idx]["messages"]
+        tools = self.train_dataset[idx].get("tools", None)
+        return self.create_conversation_manually(messages, tools)
+
+    def __getitem__(self, idx):
+        if self.packing:
+            return self._getitem_packing(idx)
+
+        sample = self._process_single_sample(idx)
+        self._show_train_sample(input_ids=sample["input_ids"], labels=sample["labels"])
+        return sample
+
+    # ── packing __getitem__ ──────────────────────────────────────────────
+
+    def _getitem_packing(self, idx):
+        """
+        Concatenate the samples assigned to this pack, add per-sequence
+        position_ids (reset to 0 at each boundary), and pad to
+        ``packing_length`` so every item in the batch has the same shape.
+
+        Returns
+        -------
+        dict with keys: input_ids, attention_mask, labels, position_ids
+            All of shape ``(packing_length,)``.
+
+        Notes
+        -----
+        * ``position_ids`` resets to 0 at each sequence boundary, which
+          Flash-Attention-2 / flex-attention can use to build a
+          block-diagonal mask automatically.
+        * Padding tokens get ``label = -100``, ``attention_mask = 0``,
+          ``position_ids = 0``.
+        """
+        sequence_indices = self.packed_idx[idx]
+
+        all_input_ids = []
+        all_labels = []
+        all_position_ids = []
+
+        for seq_idx in sequence_indices:
+            sample = self._process_single_sample(seq_idx)
+            input_ids = sample["input_ids"]   # (seq_len,)
+            labels = sample["labels"]         # (seq_len,)
+            seq_len = input_ids.size(0)
+
+            all_input_ids.append(input_ids)
+            all_labels.append(labels)
+            all_position_ids.append(torch.arange(seq_len, dtype=torch.long))
+
+        # concat
+        input_ids = torch.cat(all_input_ids, dim=0)
+        labels = torch.cat(all_labels, dim=0)
+        position_ids = torch.cat(all_position_ids, dim=0)
+        attention_mask = torch.ones(input_ids.size(0), dtype=torch.long)
+
+        # pad to packing_length
+        total_len = input_ids.size(0)
+        if total_len < self.packing_length:
+            pad_len = self.packing_length - total_len
+            pad_id = (
+                self.tokenizer.pad_token_id
+                if self.tokenizer.pad_token_id is not None
+                else 0
+            )
+            input_ids = torch.cat(
+                [input_ids, torch.full((pad_len,), pad_id, dtype=torch.long)]
+            )
+            labels = torch.cat(
+                [labels, torch.full((pad_len,), -100, dtype=torch.long)]
+            )
+            position_ids = torch.cat(
+                [position_ids, torch.zeros(pad_len, dtype=torch.long)]
+            )
+            attention_mask = torch.cat(
+                [attention_mask, torch.zeros(pad_len, dtype=torch.long)]
+            )
+
+        self._show_train_sample(input_ids=input_ids, labels=labels)
+
+        return dict(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            position_ids=position_ids,
         )
 
-        return sample
+
+# class SFTDataset(Dataset):
+    
+#     def __init__(
+#         self,
+#         train_dataset,
+#         tokenizer,
+#         max_length,
+#     ):
+#         self.train_dataset = train_dataset
+#         self.tokenizer = tokenizer
+#         self.max_length = max_length
+
+#         self.has_shown_sample = False
+
+#     def __len__(self):
+#         return len(self.train_dataset)
+    
+
+#     def create_conversation_manually(self, messages, tools):
+
+#         full = self.tokenizer.apply_chat_template(
+#             messages,
+#             tokenize=True,
+#             add_generation_prompt=False,
+#             return_dict=True,
+#             truncation=True,
+#             max_length=self.max_length,
+#             tools=tools if tools else None,
+#         )
+
+#         input_ids = full["input_ids"]
+#         attention_mask = full["attention_mask"]
+
+#         assistant_masks = [0] * len(input_ids)
+#         current_pos = 0
+
+#         for i, message in enumerate(messages):
+#             if message["role"] == "assistant":
+
+#                 context_with_reply = messages[: i + 1]
+#                 full_tokens = self.tokenizer.apply_chat_template(
+#                     context_with_reply,
+#                     tokenize=True,
+#                     add_generation_prompt=False,
+#                     truncation=True,
+#                     max_length=self.max_length,
+#                     tools=tools if tools else None,
+#                 )
+#                 reply_end_pos = len(full_tokens)
+
+#                 assistant_masks[current_pos:reply_end_pos] = [1] * (reply_end_pos - current_pos)
+
+#             else:
+
+#                 prompt_context = messages[: i + 1]
+
+#                 if message["role"] == "system":
+#                     continue
+
+#                 else:
+#                     prompt_tokens = self.tokenizer.apply_chat_template(
+#                         prompt_context,
+#                         tokenize=True,
+#                         add_generation_prompt=True,
+#                         truncation=True,
+#                         max_length=self.max_length,
+#                         tools=tools if tools else None,
+#                     )
+#                     current_pos = len(prompt_tokens)
+
+#         input_ids = torch.tensor(input_ids, dtype=torch.long)
+#         attention_mask = torch.tensor(attention_mask, dtype=torch.long)
+#         labels = input_ids.clone()
+
+#         labels[torch.tensor(assistant_masks, dtype=torch.bool) == 0] = -100
+
+#         return dict(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+    
+
+#     def _show_train_sample(self, input_ids, labels):
+
+#         if dist.is_available() and dist.is_initialized():
+#             rank = dist.get_rank()
+#         else:
+#             rank = 0 
+#         worker_info = get_worker_info()
+#         is_main_worker = (worker_info is None) or (worker_info.id == 0)
+#         if rank == 0 and is_main_worker and not self.has_shown_sample:
+#             show_sample(
+#                 input_ids=input_ids,
+#                 labels=labels,
+#                 tokenizer = self.tokenizer,
+#                 title="SFT Input and Labels",
+#                 left_column="Input IDs",
+#                 right_column="Labels"
+#             )
+#             self.has_shown_sample = True
+    
+#     def __getitem__(self, idx):
+#         messages = self.train_dataset[idx]["messages"]
+#         tools = self.train_dataset[idx]["tools"]
+#         sample = self.create_conversation_manually(messages, tools)
+
+#         self._show_train_sample(
+#             input_ids=sample["input_ids"],
+#             labels=sample["labels"],
+#         )
+
+#         return sample
 
 
 class DPODataset(Dataset):

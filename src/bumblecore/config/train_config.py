@@ -18,6 +18,8 @@ class TrainConfig:
     weight_decay: float = field(default=0.01)
     warmup_ratio: float = field(default=0.1)
     num_epochs: float = field(default=3.0)
+    packing: bool = field(default=False)
+    packing_num_proc: int = field(default=1)
     lr_scheduler_type: str = field(default="cosine")
 
     train_micro_batch_size_per_gpu: int = field(default=4)

@@ -29,5 +29,7 @@ class SFTTrainer(BaseTrainer):
             messages,
             tokenizer,
             max_length=self.config.cutoff_len,
+            packing=self.config.packing,
+            packing_num_proc=self.config.packing_num_proc,
         )
         return tokenizer, train_dataset
