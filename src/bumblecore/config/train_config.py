@@ -18,8 +18,6 @@ class TrainConfig:
     weight_decay: float = field(default=0.01)
     warmup_ratio: float = field(default=0.1)
     num_epochs: float = field(default=3.0)
-    packing: bool = field(default=False)
-    packing_num_proc: int = field(default=1)
     lr_scheduler_type: str = field(default="cosine")
 
     train_micro_batch_size_per_gpu: int = field(default=4)
@@ -47,6 +45,10 @@ class TrainConfig:
     lora_alpha: int = field(default=128)
     lora_dropout: float = field(default=0.1)
     lora_target_modules: Optional[Union[List[str], str]] = field(default=None)
+
+    # Packing settings
+    packing: bool = field(default=False)
+    packing_num_proc: int = field(default=1)
 
 
     ld_alpha: float = field(default=1.0)       

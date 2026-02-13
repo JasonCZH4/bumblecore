@@ -1,57 +1,20 @@
-import io
-
 import torch
 import torch.distributed as dist
-from torch.utils.data import Dataset,get_worker_info
-from rich.console import Console
-from rich.table import Table
-from rich.text import Text
+from torch.utils.data import Dataset, get_worker_info
 from tqdm import tqdm
 
 import math
 import multiprocessing as mp
 from itertools import chain
 
-
-def show_sample(
-    input_ids, 
-    labels, 
-    tokenizer, 
-    title="Input and Labels" ,
-    left_column = "Input IDs", 
-    right_column = "Labels"
-):
-    input_ids = input_ids.tolist()
-    labels = labels.tolist()
-
-    valid_labels_list = [token_id for token_id in labels if token_id != -100]
-    decoded_input = tokenizer.decode(input_ids)
-    decoded_labels = tokenizer.decode(valid_labels_list)
-
-    table = Table(show_header=True, show_lines=True, title=title)
-    table.add_column(left_column, overflow="fold")
-    table.add_column(right_column, overflow="fold")
-
-    wrapped_input = Text(decoded_input, no_wrap=False, overflow="fold")
-    wrapped_labels = Text(decoded_labels, no_wrap=False, overflow="fold")
-
-    table.add_row(str(input_ids), str(labels))
-    table.add_row(wrapped_input, wrapped_labels)
-
-    with io.StringIO() as buf:
-        console = Console(file=buf, force_terminal=False)
-        console.print(table)
-        output = buf.getvalue()
-
-    tqdm.write(output.rstrip())
-
-
-def get_padding_value(tokenizer):
-    if tokenizer.pad_token_id is not None:
-        return tokenizer.pad_token_id
-    
-    eos = tokenizer.eos_token_id
-    return eos[0] if isinstance(eos, list) else eos
+from .dataset_utils import (
+    show_sample,
+    get_padding_value,
+    calculate_matched_group,
+    split_list,
+    is_master,
+    is_distributed,
+)
 
 
 class PretrainDataset(Dataset):
@@ -123,37 +86,7 @@ class PretrainDataset(Dataset):
         return sample
 
 
-def calculate_matched_group(sequences, packing_length: int, is_finished: bool = True):
-    """Bin-packing via First Fit Decreasing (https://arxiv.org/pdf/2404.10830)."""
-    if len(sequences) == 0:
-        return [], []
-    import binpacking
-    # sequences 是 [(index, length), ...] 列表
-    # weight_pos=1 表示长度在元组第二个位置
-    # 将一组物品分配到多个容量固定的箱子（bins）中，使得每个箱子的总容量不超过指定的最大值。
-    sequences = binpacking.to_constant_volume(sequences, packing_length, weight_pos=1)
-    # sequences 是列表的列表，每个子列表包含多个 (index, length) 元组
-    # 如果不是最后一批，保留最后一个不完整组用于下一批
-    if sequences and not is_finished:
-        sequences, ret_sequences = sequences[:-1], sequences[-1]
-    else:
-        ret_sequences = []
-    return sequences, ret_sequences
 
-def split_list(lst, n):
-    # 划分列表为n个子列表，对应n个子进程处理
-    k, m = divmod(len(lst), n)
-    return [lst[i * k + min(i, m):(i + 1) * k + min(i + 1, m)] for i in range(n)]
-
-
-def _is_master():
-    if dist.is_available() and dist.is_initialized():
-        return dist.get_rank() == 0
-    return True
-
-
-def _is_dist():
-    return dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
 
 class SFTDataset(Dataset):
     PACKING_BATCH_SIZE = 1000
@@ -171,6 +104,9 @@ class SFTDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.has_shown_sample = False
+
+        if len(train_dataset) == 0:
+            raise ValueError("train_dataset cannot be empty")
 
         # ── packing bookkeeping ──
         self.packing = packing
@@ -209,7 +145,7 @@ class SFTDataset(Dataset):
 
     def _setup_packing(self):
         """Build packed_idx / packed_length using multi-process bin-packing."""
-        if _is_master():
+        if is_master():
             # 计算每条数据的长度
             lengths = self._compute_lengths()
             offset = 0
@@ -253,7 +189,7 @@ class SFTDataset(Dataset):
             self.packed_idx, self.packed_length = None, None
 
         # broadcast to all ranks
-        if _is_dist():
+        if is_distributed():
             obj_list = [(self.packed_idx, self.packed_length)]
             dist.broadcast_object_list(obj_list)
             self.packed_idx, self.packed_length = obj_list[0]
@@ -372,7 +308,7 @@ class SFTDataset(Dataset):
             return self._getitem_packing(idx)
 
         sample = self._process_single_sample(idx)
-        self._show_train_sample(input_ids=sample["input_ids"], labels=sample["labels"])
+        # self._show_train_sample(input_ids=sample["input_ids"], labels=sample["labels"])
         return sample
 
     # ── packing __getitem__ ──────────────────────────────────────────────
@@ -380,21 +316,19 @@ class SFTDataset(Dataset):
     def _getitem_packing(self, idx):
         """
         Concatenate the samples assigned to this pack, add per-sequence
-        position_ids (reset to 0 at each boundary), and pad to
-        ``packing_length`` so every item in the batch has the same shape.
+        position_ids (reset to 0 at each boundary).
 
         Returns
         -------
         dict with keys: input_ids, attention_mask, labels, position_ids
-            All of shape ``(packing_length,)``.
+            All tensors are concatenated but NOT padded.
+            Padding is handled by PackingDataCollator.
 
         Notes
         -----
         * ``position_ids`` resets to 0 at each sequence boundary, which
           Flash-Attention-2 / flex-attention can use to build a
           block-diagonal mask automatically.
-        * Padding tokens get ``label = -100``, ``attention_mask = 0``,
-          ``position_ids = 0``.
         """
         sequence_indices = self.packed_idx[idx]
 
@@ -417,28 +351,6 @@ class SFTDataset(Dataset):
         labels = torch.cat(all_labels, dim=0)
         position_ids = torch.cat(all_position_ids, dim=0)
         attention_mask = torch.ones(input_ids.size(0), dtype=torch.long)
-
-        # pad to packing_length
-        total_len = input_ids.size(0)
-        if total_len < self.packing_length:
-            pad_len = self.packing_length - total_len
-            pad_id = (
-                self.tokenizer.pad_token_id
-                if self.tokenizer.pad_token_id is not None
-                else 0
-            )
-            input_ids = torch.cat(
-                [input_ids, torch.full((pad_len,), pad_id, dtype=torch.long)]
-            )
-            labels = torch.cat(
-                [labels, torch.full((pad_len,), -100, dtype=torch.long)]
-            )
-            position_ids = torch.cat(
-                [position_ids, torch.zeros(pad_len, dtype=torch.long)]
-            )
-            attention_mask = torch.cat(
-                [attention_mask, torch.zeros(pad_len, dtype=torch.long)]
-            )
 
         self._show_train_sample(input_ids=input_ids, labels=labels)
 
@@ -612,6 +524,72 @@ class DPOCollator:
             rejected_labels=self._right_pad_to_len(
             rejected_labels, max_length, -100
         ),
+        )
+
+    @staticmethod
+    def _right_pad_to_len(sequences, max_length, padding_value):
+        padded = torch.nn.utils.rnn.pad_sequence(
+            sequences, batch_first=True, padding_value=padding_value
+        )
+        if padded.size(1) < max_length:
+            diff = max_length - padded.size(1)
+            pad_tensor = torch.full(
+                (padded.size(0), diff),
+                padding_value,
+                dtype=padded.dtype,
+                device=padded.device
+            )
+            padded = torch.cat([padded, pad_tensor], dim=1)
+        return padded
+
+
+class PackingDataCollator:
+    """
+    Data collator for packed sequences.
+    
+    Pads a batch of packed sequences (with varying lengths) to the max length
+    in the batch. Similar to DataCollator but also handles position_ids.
+    """
+
+    def __init__(self, tokenizer):
+        self.input_ids_padding_value = get_padding_value(tokenizer=tokenizer)
+
+    def __call__(self, batch):
+        if not batch:
+            return dict(
+                input_ids=torch.tensor([], dtype=torch.long).reshape(0, 0),
+                attention_mask=torch.tensor([], dtype=torch.long).reshape(0, 0),
+                labels=torch.tensor([], dtype=torch.long).reshape(0, 0),
+                position_ids=torch.tensor([], dtype=torch.long).reshape(0, 0),
+            )
+
+        input_ids = [item["input_ids"] for item in batch]
+        attention_mask = [item["attention_mask"] for item in batch]
+        labels = [item["labels"] for item in batch]
+        position_ids = [item["position_ids"] for item in batch]
+
+        # Find max length in this batch
+        max_length = max(len(x) for x in input_ids)
+
+        # Pad all sequences to max_length
+        input_ids = self._right_pad_to_len(
+            input_ids, max_length, self.input_ids_padding_value
+        )
+        attention_mask = self._right_pad_to_len(
+            attention_mask, max_length, 0
+        )
+        labels = self._right_pad_to_len(
+            labels, max_length, -100
+        )
+        position_ids = self._right_pad_to_len(
+            position_ids, max_length, 0
+        )
+
+        return dict(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            position_ids=position_ids,
         )
 
     @staticmethod

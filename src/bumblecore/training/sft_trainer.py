@@ -1,7 +1,7 @@
 from transformers import AutoTokenizer
 
 from .base_trainer import BaseTrainer
-from ..data_processing import DataFormatter, SFTDataset, load_sft_data, DataCollator
+from ..data_processing import DataFormatter, SFTDataset, load_sft_data, DataCollator, PackingDataCollator
 from ..config import TrainConfig
 
 class SFTTrainer(BaseTrainer):
@@ -9,7 +9,11 @@ class SFTTrainer(BaseTrainer):
         self.config = config
         self.format_preprocess_fn = DataFormatter(self.config.training_stage)
         self.tokenizer, self.train_dataset = self._prepare_datasets()
-        self.data_collator = DataCollator(self.tokenizer)
+        # Use PackingDataCollator when packing is enabled, otherwise use standard DataCollator
+        if self.config.packing:
+            self.data_collator = PackingDataCollator(self.tokenizer)
+        else:
+            self.data_collator = DataCollator(self.tokenizer)
         super().__init__(config, self.train_dataset, self.tokenizer, self.data_collator)
         self._print_train_parameters()
 
